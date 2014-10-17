@@ -72,10 +72,11 @@ TelEngine::String Parser::getLine(int eol /* = '\n'*/)
 	do {
 		char* p = (char*)memchr(m_buf, eol, m_bufuse);
 		if(p) {
+			++p;
 			size_t len = p - m_buf;
 			ret.append(m_buf, len);
-			memmove(m_buf, p + 1, m_bufuse - len - 1);
-			m_bufuse -= len + 1;
+			memmove(m_buf, p, m_bufuse - len);
+			m_bufuse -= len;
 			return ret;
 		}
 		if(! m_stream.valid())
@@ -95,7 +96,6 @@ Entry* Parser::parseLine(TelEngine::String s)
 	const static TelEngine::Regexp re5("^\\([0-9\\.]\\+ \\)\\?<[a-zA-Z0-9]\\+:[a-zA-Z0-9]\\+> '.*' \\(sending\\|received\\) .* \\(to\\|from\\) \\([0-9\\.]\\+\\):[0-9]\\+");
 	const static TelEngine::Regexp re6("^\\([0-9\\.]\\+ \\)\\?<[a-zA-Z0-9]\\+:[a-zA-Z0-9]\\+> '[a-z]\\+:[0-9\\.]\\+:[0-9]\\+-\\([0-9\\.]\\+\\):[0-9]\\+' \\(received [0-9]\\+ bytes\\|sending code [0-9]\\+\\)");
 	if(m_verbatimCopy && m_last) {
-		m_last->append("\n");
 		m_last->append(s);
 		if(s.matches(re4))
 			m_verbatimCopy = false;
@@ -104,7 +104,6 @@ Entry* Parser::parseLine(TelEngine::String s)
 	if(s.matches(re2) && m_last && m_last->type() == Entry::MESSAGE) { // simple key = value
 //		fprintf(stderr, "Got param, last: %p, type: %d\n", m_last, m_last ? m_last->type() : -1);
 //		fprintf(stderr, " key: %s, value: %s\n", s.matchString(1).c_str(), s.matchString(2).c_str());
-		m_last->append("\n");
 		m_last->append(s);
 		m_last->setParam(s.matchString(1), s.matchString(2));
 		return NULL;
@@ -114,18 +113,13 @@ Entry* Parser::parseLine(TelEngine::String s)
 		TelEngine::String value = s.matchString(2);
 		TelEngine::String tail = getLine('\'');
 //		fprintf(stderr, "multiline key: %s, value: %s, tail: %s\n", key.c_str(), value.c_str(), tail.c_str());
-		m_last->append("\n");
 		m_last->append(s);
-		m_last->append("\n");
 		m_last->append(tail);
-		m_last->append("'"); // getLine removed quote
-		value += "\n";
 		value += tail;
-		m_last->setParam(key, value);
+		m_last->setParam(key, value.substr(0, value.length() - 1));
 		return NULL;
 	}
 	if(s[0] == ' ' && m_last) { // retval && thread
-		m_last->append("\n");
 		m_last->append(s);
 		return NULL;
 	}
@@ -141,7 +135,6 @@ Entry* Parser::parseLine(TelEngine::String s)
 		return new Entry(Entry::NETWORK, s);
 	}
 	if(s.matches(re4) && m_last) {
-		m_last->append("\n");
 		m_last->append(s);
 		m_verbatimCopy = true;
 		return NULL;
@@ -182,7 +175,6 @@ void Grep::run(TelEngine::Stream& in, TelEngine::Stream& out)
 	Entry* e = NULL;
 	while(( e = parser.get() )) {
 		out.writeData(*e);
-		out.writeData("\n");
 		delete e;
 	}
 }
