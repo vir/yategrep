@@ -8,25 +8,37 @@
 class Entry: public TelEngine::NamedList // implies String
 {
 public:
-	enum Type { UNKNOWN = 0, MESSAGE, NETWORK };
+	enum Type { UNKNOWN = 0, MESSAGE, NETWORK, STARTUP };
 public:
 	Entry(Type type, const TelEngine::String& text)
 		: NamedList(text)
 		, m_type(type)
+		, m_mark(false)
 	{
 	}
 	Type type() const
 		{ return m_type; }
+	bool marked() const
+		{ return m_mark; }
+	void mark(bool value = true)
+		{ m_mark = value; }
 private:
 	Type m_type;
+	bool m_mark;
 };
 
-class Query: public TelEngine::NamedList
+class Query
 {
 public:
-	Query(): NamedList("Query")
+	Query()
+		: m_params("QueryParams")
 	{
 	}
+	TelEngine::NamedList& params()
+		{ return m_params; }
+	bool matches(const Entry& e);
+private:
+	TelEngine::NamedList m_params;
 };
 
 class Parser
@@ -54,16 +66,74 @@ private:
 	bool m_verbatimCopy;
 };
 
+template<class T>
+class RingBuf
+{
+public:
+	RingBuf(size_t size)
+		: m_size(size), m_put_index(0), m_get_index(0), m_empty(true)
+		{ m_buf = new T*[size]; }
+	~RingBuf()
+		{ delete[] m_buf; }
+	void push(T* entry)
+	{
+		if(m_put_index == m_get_index && ! m_empty)
+			return; // XXX overflow XXX
+		m_buf[m_put_index++] = entry;
+		if(m_put_index >= m_size)
+			m_put_index = 0;
+		m_empty = false;
+	}
+	T* pop()
+	{
+		if(m_empty)
+			return NULL;
+		T* entry = m_buf[m_get_index++];
+		if(m_get_index >= m_size)
+			m_get_index = 0;
+		if(m_get_index == m_put_index)
+			m_empty = true;
+	}
+	size_t count() const
+	{
+		if(m_empty)
+			return 0;
+		else if(m_put_index > m_get_index)
+			return m_put_index - m_get_index;
+		else
+			return m_put_index + m_size - m_get_index;
+	}
+	size_t avail() const
+		{ return m_size - count(); }
+	T* at(size_t index)
+	{
+		if(index >= count())
+			return NULL;
+		index += m_get_index;
+		if(index > m_size)
+			index -= m_size;
+		return m_buf[index];
+	}
+private:
+	T** m_buf;
+	size_t m_size;
+	size_t m_put_index;
+	size_t m_get_index;
+	bool m_empty;
+};
+
 class Grep
 {
 public:
-	Grep(const Query& q)
+	Grep(const Query& q, size_t backlog = 1000)
 		: m_query(q)
+		, m_buf(backlog)
 	{
 	}
 	void run(TelEngine::Stream& in, TelEngine::Stream& out);
 private:
 	const Query& m_query;
+	RingBuf<Entry> m_buf;
 };
 
 TelEngine::String Parser::getLine(int eol /* = '\n'*/)
@@ -95,6 +165,7 @@ Entry* Parser::parseLine(TelEngine::String s)
 	const static TelEngine::Regexp re4("^-----");
 	const static TelEngine::Regexp re5("^\\([0-9\\.]\\+ \\)\\?<[a-zA-Z0-9]\\+:[a-zA-Z0-9]\\+> '.*' \\(sending\\|received\\) .* \\(to\\|from\\) \\([0-9\\.]\\+\\):[0-9]\\+");
 	const static TelEngine::Regexp re6("^\\([0-9\\.]\\+ \\)\\?<[a-zA-Z0-9]\\+:[a-zA-Z0-9]\\+> '[a-z]\\+:[0-9\\.]\\+:[0-9]\\+-\\([0-9\\.]\\+\\):[0-9]\\+' \\(received [0-9]\\+ bytes\\|sending code [0-9]\\+\\)");
+	const static TelEngine::Regexp re7("^Yate ([0-9]\\+) is starting ");
 	if(m_verbatimCopy && m_last) {
 		m_last->append(s);
 		if(s.matches(re4))
@@ -139,6 +210,9 @@ Entry* Parser::parseLine(TelEngine::String s)
 		m_verbatimCopy = true;
 		return NULL;
 	}
+	if(s.matches(re7)) {
+		return new Entry(Entry::STARTUP, s);
+	}
 	fprintf(stderr, "Building UNKNOWN: %s\n", s.c_str());
 	return new Entry(Entry::UNKNOWN, s);
 }
@@ -182,7 +256,7 @@ void Grep::run(TelEngine::Stream& in, TelEngine::Stream& out)
 int main(int argc, const char* argv[])
 {
 	Query query;
-	query.setParam("billid", "1413175501-2747");
+	query.params().setParam("billid", "1413175501-2747");
 	Grep grep(query);
 	TelEngine::File input;
 	if(argc == 2) {
