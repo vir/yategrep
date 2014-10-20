@@ -32,13 +32,21 @@ class Query
 public:
 	Query()
 		: m_params("QueryParams")
+		, m_modified(false)
 	{
 	}
 	TelEngine::NamedList& params()
 		{ return m_params; }
-	bool matches(const Entry& e);
+	bool matches(const Entry& e, bool partial = false);
+	bool modified() const
+		{ return m_modified; }
 private:
 	TelEngine::NamedList m_params;
+	TelEngine::ObjList m_channels;
+	unsigned int m_newChannels;
+	TelEngine::ObjList m_addrs;
+	unsigned int m_newAddrs;
+	bool m_modified;
 };
 
 class Parser
@@ -93,6 +101,7 @@ public:
 			m_get_index = 0;
 		if(m_get_index == m_put_index)
 			m_empty = true;
+		return entry;
 	}
 	size_t count() const
 	{
@@ -114,6 +123,8 @@ public:
 			index -= m_size;
 		return m_buf[index];
 	}
+	bool empty() const
+		{ return m_empty; }
 private:
 	T** m_buf;
 	size_t m_size;
@@ -125,16 +136,49 @@ private:
 class Grep
 {
 public:
-	Grep(const Query& q, size_t backlog = 1000)
+	Grep(Query& q, size_t backlog = 1000)
 		: m_query(q)
 		, m_buf(backlog)
 	{
 	}
 	void run(TelEngine::Stream& in, TelEngine::Stream& out);
 private:
-	const Query& m_query;
+	Query& m_query;
 	RingBuf<Entry> m_buf;
 };
+
+bool Query::matches(const Entry& e, bool partial /* = false */)
+{
+	if(! partial)
+		m_modified = false;
+	if(/*e.type() != Entry::MESSAGE || */! e.count())
+		return false;
+	bool match = false;
+	unsigned qn = params().length();
+//fprintf(stderr, "Query: %u params\n", qn);
+	for(unsigned int qi = 0; qi < qn; ++qi) {
+		TelEngine::NamedString* q = params().getParam(qi);
+		if(! q)
+			continue;
+		unsigned int n = e.length();
+//fprintf(stderr, "Entry: %u params (checking query param %u\n", n, qi);
+		for(unsigned int i = 0; i < n; ++i) {
+			TelEngine::NamedString* s = e.getParam(i);
+			if(! s)
+				continue;
+			if(s->name() == q->name()) {
+				match = true;
+				if(*s != *q)
+					return false; /* AND logic, fail on first non-equal param */
+			}
+		}
+	}
+	if(! match)
+		return false;
+	/* positive match! */
+	/* XXX TODO: check for new channels, append, set modified flag */
+	return true;
+}
 
 TelEngine::String Parser::getLine(int eol /* = '\n'*/)
 {
@@ -213,7 +257,7 @@ Entry* Parser::parseLine(TelEngine::String s)
 	if(s.matches(re7)) {
 		return new Entry(Entry::STARTUP, s);
 	}
-	fprintf(stderr, "Building UNKNOWN: %s\n", s.c_str());
+//	fprintf(stderr, "Building UNKNOWN: %s\n", s.c_str());
 	return new Entry(Entry::UNKNOWN, s);
 }
 
@@ -238,25 +282,58 @@ Entry* Parser::get()
 
 void Grep::run(TelEngine::Stream& in, TelEngine::Stream& out)
 {
-#if 0
+#if 0 // very simple "/bin/cat"
 	char buf[8192];
 	int rd;
 	while((rd = in.readData(buf, sizeof(buf)))) {
 		out.writeData(buf, rd);
 	}
-#endif
+#elif 0 // advanced "/bin/cat"
 	Parser parser(in);
 	Entry* e = NULL;
 	while(( e = parser.get() )) {
 		out.writeData(*e);
 		delete e;
 	}
+#else
+	Parser parser(in);
+	Entry* e = NULL;
+	while(( e = parser.get() )) {
+		if(m_query.matches(*e)) {
+			e->mark();
+			if(m_query.modified()) {
+				for(size_t index = 1; index < m_buf.count(); ++index) {
+					if(m_query.matches(*m_buf.at(index), true))
+						m_buf.at(index)->mark();
+				}
+			}
+		}
+		m_buf.push(e);
+
+		if(m_buf.avail() < 1) {
+			e = m_buf.pop();
+			if(e->marked())
+				out.writeData("MARK>>> ");
+			out.writeData(*e);
+			delete e;
+		}
+	}
+	while(! m_buf.empty()) {
+		e = m_buf.pop();
+		if(e->marked())
+			out.writeData("MARK>>> ");
+		out.writeData(*e);
+		delete e;
+	}
+#endif
 }
 
 int main(int argc, const char* argv[])
 {
 	Query query;
 	query.params().setParam("billid", "1413175501-2747");
+//	query.params().setParam("nonce", "993d17cc6f3b5f8a35c88b3936d3e0d7.1413253502");
+//	query.params().setParam("nodename", "unicorn");
 	Grep grep(query);
 	TelEngine::File input;
 	if(argc == 2) {
