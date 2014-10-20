@@ -170,14 +170,22 @@ private:
 static bool isChannelParam(const TelEngine::String& name)
 {
 	using namespace TelEngine;
-//fprintf(stderr, "isChannelParam(%s)\n", name.c_str());
 	if(name == YSTRING("id"))
 		return true;
 	if(name == YSTRING("targetid"))
 		return true;
 	if(name == YSTRING("peerid"))
 		return true;
-	// XXX there are lots of fork-generated names XXX
+	if(name == YSTRING("lastpeerid"))
+		return true;
+	if(name == YSTRING("newid"))
+		return true;
+	if(name == YSTRING("id.1"))
+		return true;
+	if(name == YSTRING("newid.1"))
+		return true;
+	if(name == YSTRING("peerid.1"))
+		return true;
 	return false;
 }
 
@@ -395,10 +403,10 @@ void Grep::run(TelEngine::Stream& in, TelEngine::Stream& out)
 					count = 0;
 					for(size_t index = 0; index < m_buf.count() - 1; ++index) {
 						Entry* e = m_buf.at(index);
-						if(!e)
+						if(!e || e->marked())
 							continue;
 						if(m_query.matches(*e, true)) {
-							m_buf.at(index)->mark();
+							e->mark();
 							if(m_query.update(*e, false))
 								++count;
 						}
