@@ -2,8 +2,7 @@
 
 #include <stdio.h>
 #include <string.h>
-//#include <unistd.h>
-//#include <stdlib.h>
+#include <stdlib.h>
 
 class Entry: public TelEngine::NamedList // implies String
 {
@@ -137,6 +136,21 @@ public:
 			m_empty = true;
 		return entry;
 	}
+	T* pushpop(T* newentry)
+	{
+		T* r = NULL;
+		if(m_put_index == m_get_index && ! m_empty)
+			r = m_buf[m_get_index++];
+		if(m_get_index >= m_size)
+			m_get_index = 0;
+		m_buf[m_put_index++] = newentry;
+		if(m_put_index >= m_size)
+			m_put_index = 0;
+		m_empty = false;
+		return r;
+	}
+	size_t size() const
+		{ return m_size; }
 	size_t count() const
 	{
 		if(m_empty)
@@ -153,7 +167,7 @@ public:
 		if(index >= count())
 			return NULL;
 		index += m_get_index;
-		if(index > m_size)
+		if(index >= m_size)
 			index -= m_size;
 		return m_buf[index];
 	}
@@ -165,23 +179,6 @@ private:
 	size_t m_put_index;
 	size_t m_get_index;
 	bool m_empty;
-};
-
-class Grep
-{
-public:
-	Grep(size_t backlog = 1000)
-		: m_buf(backlog)
-		, m_xhtml(false)
-	{
-	}
-	void run(Query& query, TelEngine::Stream& in, TelEngine::Stream& out);
-	void xhtml(bool enable)
-		{ m_xhtml = enable; }
-private:
-	void output(const Entry& e, TelEngine::Stream& out);
-	RingBuf<Entry> m_buf;
-	bool m_xhtml;
 };
 
 class HtmlFilter:public TelEngine::Stream
@@ -249,6 +246,57 @@ public:
 	TelEngine::Stream& unfiltered;
 private:
 	bool m_killNewline;
+};
+
+class Writer
+{
+public:
+	Writer(TelEngine::Stream& strm)
+		: m_strm(strm)
+		, m_xhtml(false)
+		, m_context(0)
+		, m_showflag(false)
+		, m_tailcount(0)
+		, m_skipcount(0)
+		, m_buf(NULL)
+		{ }
+	~Writer()
+	{
+		if(m_skipcount)
+			outputSeparator();
+		delete m_buf;
+	}
+	void eat(Entry* entry);
+	void xhtml(bool enable)
+		{ m_xhtml = enable; }
+	void context(unsigned int lines)
+	{
+		delete m_buf;
+		m_context = lines;
+		m_buf = lines ? new RingBuf<Entry>(lines) : NULL;
+	}
+protected:
+	void output(const Entry& e);
+	void outputSeparator();
+private:
+	TelEngine::Stream& m_strm;
+	bool m_xhtml;
+	unsigned int m_context;
+	bool m_showflag;
+	unsigned int m_tailcount;
+	unsigned int m_skipcount;
+	RingBuf<Entry>* m_buf;
+};
+
+class Grep
+{
+public:
+	Grep(size_t backlog = 1000)
+		: m_buf(backlog)
+		{ }
+	void run(Query& query, Parser parser, Writer& writer);
+private:
+	RingBuf<Entry> m_buf;
 };
 
 static bool isChannelParam(const TelEngine::String& name)
@@ -457,7 +505,7 @@ Entry* Parser::get()
 	}
 }
 
-void Grep::run(Query& query, TelEngine::Stream& in, TelEngine::Stream& out)
+void Grep::run(Query& query, Parser parser, Writer& writer)
 {
 #if 0 // very simple "/bin/cat"
 	char buf[8192];
@@ -473,7 +521,6 @@ void Grep::run(Query& query, TelEngine::Stream& in, TelEngine::Stream& out)
 		delete e;
 	}
 #else
-	Parser parser(in);
 	Entry* e = NULL;
 	while(( e = parser.get() )) {
 		if(query.matches(*e)) {
@@ -497,23 +544,44 @@ void Grep::run(Query& query, TelEngine::Stream& in, TelEngine::Stream& out)
 			}
 #endif
 		}
-		m_buf.push(e);
-
-		if(m_buf.avail() < 1) {
-			e = m_buf.pop();
-			output(*e, out);
-			delete e;
-		}
+		e = m_buf.pushpop(e);
+		if(e)
+			writer.eat(e);
 	}
-	while(! m_buf.empty()) {
-		e = m_buf.pop();
-		output(*e, out);
-		delete e;
-	}
+	while(! m_buf.empty())
+		writer.eat(m_buf.pop());
 #endif
 }
 
-void Grep::output(const Entry& e, TelEngine::Stream& out)
+void Writer::eat(Entry* entry)
+{
+	if(entry->marked()) {
+		if(! m_showflag && m_skipcount)
+			outputSeparator();
+		m_showflag = true;
+		m_tailcount = 0;
+	}
+
+	if(m_buf)
+		entry = m_buf->pushpop(entry);
+	if(! entry)
+		return;
+
+	if(m_showflag)
+		output(*entry);
+	else
+		++m_skipcount;
+
+	if(entry->marked()) {
+		m_tailcount = 0;
+	} else {
+		if(++m_tailcount == m_context)
+			m_showflag = false;
+	}
+	delete entry;
+}
+
+void Writer::output(const Entry& e)
 {
 	if(m_xhtml) {
 		TelEngine::String s("<pre class=\"");
@@ -521,19 +589,33 @@ void Grep::output(const Entry& e, TelEngine::Stream& out)
 		if(e.marked())
 			s << " marked";
 		s << "\">";
-		out.writeData(s);
-		HtmlFilter(out, true).writeData(e);
-		out.writeData("</pre>\n");
+		m_strm.writeData(s);
+		HtmlFilter(m_strm, true).writeData(e);
+		m_strm.writeData("</pre>\n");
 	}
 	else { // no xhtml
 		if(e.marked())
-			out.writeData("MARK>>> ");
+			m_strm.writeData("MARK>>> ");
 #if 0
-		out.writeData(TelEngine::String((int)e.type()));
-		out.writeData(") ");
+		m_strm.writeData(TelEngine::String((int)e.type()));
+		m_strm.writeData(") ");
 #endif
-		out.writeData(e);
+		m_strm.writeData(e);
 	}
+	m_skipcount = 0;
+}
+
+void Writer::outputSeparator()
+{
+	TelEngine::String msg;
+	if(m_xhtml)
+		msg << "<div class=\"separator\">";
+	msg << " ... skipped " << m_skipcount << " log entries ...";
+	if(m_xhtml)
+		msg << "</div>";
+	msg << "\n";
+	m_strm.writeData(msg);
+	m_skipcount = 0;
 }
 
 static void help()
@@ -542,6 +624,7 @@ static void help()
 	puts("Opts:\n\t-h\tthis help\n\t-o fn\tset output to file named fn");
 	puts("\t-D\tdump to stderr resulting query object");
 	puts("\t-x\t(X)HTML fragment output\n\t-X\tfull HTML document output");
+	puts("\t-C nn\tshow nn messages of context before and after each match");
 }
 
 const static char* html_header =
@@ -565,7 +648,11 @@ int main(int argc, char* argv[])
 	const char* outfile = NULL;
 	bool dumpquery = false;
 	bool fullhtml = false;
-	Grep grep;
+
+	TelEngine::File input;
+	TelEngine::File output;
+	Parser parser(input);
+	Writer writer(output);
 
 	/* parse command-line options */
 	++argv; // skip our filename
@@ -586,7 +673,11 @@ int main(int argc, char* argv[])
 			case 'X':
 				fullhtml = true;
 			case 'x':
-				grep.xhtml(true);
+				writer.xhtml(true);
+				break;
+			case 'C':
+				writer.context(atoi(*++argv));
+				--argc;
 				break;
 			default:
 				fprintf(stderr, "Unknown command-line option '%s'\n", *argv);
@@ -612,8 +703,6 @@ int main(int argc, char* argv[])
 	++argv; --argc;
 
 	/* parse file name(s) */
-	TelEngine::File input;
-	TelEngine::File output;
 
 	if(outfile) {
 		output.openPath(outfile, true, false, true, false, true);
@@ -630,7 +719,8 @@ int main(int argc, char* argv[])
 	if(fullhtml)
 		static_cast<TelEngine::Stream&>(output).writeData(html_header);
 
-	grep.run(query, input, output);
+	Grep grep;
+	grep.run(query, parser, writer);
 
 	if(fullhtml)
 		static_cast<TelEngine::Stream&>(output).writeData(html_footer);
