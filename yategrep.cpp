@@ -22,6 +22,21 @@ public:
 		{ return m_mark; }
 	void mark(bool value = true)
 		{ m_mark = value; }
+	static const char* typeString(Type t)
+	{
+		switch(t) {
+			case UNKNOWN:
+				return "unknown";
+			case MESSAGE:
+				return "message";
+			case NETWORK:
+				return "network";
+			case STARTUP:
+				return "startup";
+			default:
+				return "xxx";
+		}
+	}
 private:
 	Type m_type;
 	bool m_mark;
@@ -42,7 +57,7 @@ public:
 	bool update(const Entry& e, bool reset); /**< Updates query with new channels and addresses from log entry. @return true if query was really modified */
 	void dump(TelEngine::Stream& out)
 	{
-		out.writeData("Params:\n ");
+		out.writeData("Query params:\n ");
 		TelEngine::String d;
 		m_params.dump(d, " ", '\'', true);
 		out.writeData(d);
@@ -155,16 +170,85 @@ private:
 class Grep
 {
 public:
-	Grep(Query& q, size_t backlog = 1000)
-		: m_query(q)
-		, m_buf(backlog)
+	Grep(size_t backlog = 1000)
+		: m_buf(backlog)
+		, m_xhtml(false)
 	{
 	}
-	void run(TelEngine::Stream& in, TelEngine::Stream& out);
+	void run(Query& query, TelEngine::Stream& in, TelEngine::Stream& out);
+	void xhtml(bool enable)
+		{ m_xhtml = enable; }
 private:
 	void output(const Entry& e, TelEngine::Stream& out);
-	Query& m_query;
 	RingBuf<Entry> m_buf;
+	bool m_xhtml;
+};
+
+class HtmlFilter:public TelEngine::Stream
+{
+public:
+	HtmlFilter(TelEngine::Stream& pipe, bool killNewline = false)
+		: unfiltered(pipe)
+		, m_killNewline(killNewline)
+		{ }
+	virtual bool terminate()
+		{ return unfiltered.terminate(); }
+	virtual bool valid() const
+		{ return unfiltered.valid(); }
+	virtual int writeData(const void* buffer, int length)
+	{
+		const char* buf = (const char*)buffer;
+		while((buf[length - 1] == '\n' || buf[length - 1] == '\r') && m_killNewline)
+			--length;
+		int ret = 0;
+		while(length) {
+			const char* p = buf;
+			do {
+				switch(*p) {
+					case '<':
+					case '>':
+					case '&':
+					case '"':
+						break;
+					default:
+						++p;
+						if(--length)
+							continue;
+						break;
+				}
+			} while(0);
+			ret += unfiltered.writeData(buf, p - buf);
+			buf = p;
+
+			if(! length)
+				break;
+			switch(*buf) {
+				case '<':
+					ret += unfiltered.writeData("&lt;");
+					break;
+				case '>':
+					ret += unfiltered.writeData("&gt;");
+					break;
+				case '&':
+					ret += unfiltered.writeData("&amp;");
+					break;
+				case '"':
+					ret += unfiltered.writeData("&quot;");
+					break;
+				default:
+					continue;
+			}
+			++buf;
+			--length;
+		}
+		return ret;
+	}
+	virtual int readData (void* buffer, int length)
+		{ return unfiltered.readData(buffer, length); }
+	using TelEngine::Stream::writeData;
+	TelEngine::Stream& unfiltered;
+private:
+	bool m_killNewline;
 };
 
 static bool isChannelParam(const TelEngine::String& name)
@@ -256,7 +340,6 @@ bool Query::update(const Entry& e, bool reset)
 		m_newChannels = m_channels.count();
 		m_newAddrs = m_addrs.count();
 	}
-fprintf(stderr, "Query::update called\n");
 	bool modified = false;
 	unsigned int n = e.length();
 	for(unsigned int i = 0; i < n; ++i) {
@@ -267,11 +350,10 @@ fprintf(stderr, "Query::update called\n");
 			continue;
 		if(m_channels.find(*s))
 			continue;
-fprintf(stderr, "passwd 3ed(%s=%s)\n", s->name().c_str(), s->c_str());
 		m_channels.append(new TelEngine::String(*s), false);
 		modified = true;
 	}
-	/* XXX TODO: check for new channels, append, set modified flag */
+	/* XXX TODO: check for new addresses */
 	return modified;
 }
 
@@ -375,7 +457,7 @@ Entry* Parser::get()
 	}
 }
 
-void Grep::run(TelEngine::Stream& in, TelEngine::Stream& out)
+void Grep::run(Query& query, TelEngine::Stream& in, TelEngine::Stream& out)
 {
 #if 0 // very simple "/bin/cat"
 	char buf[8192];
@@ -394,10 +476,10 @@ void Grep::run(TelEngine::Stream& in, TelEngine::Stream& out)
 	Parser parser(in);
 	Entry* e = NULL;
 	while(( e = parser.get() )) {
-		if(m_query.matches(*e)) {
+		if(query.matches(*e)) {
 			e->mark();
 #if 1 /* DEEP SEARCH */
-			if(m_query.update(*e, true)) {
+			if(query.update(*e, true)) {
 				int count;
 				do {
 					count = 0;
@@ -405,9 +487,9 @@ void Grep::run(TelEngine::Stream& in, TelEngine::Stream& out)
 						Entry* e = m_buf.at(index);
 						if(!e || e->marked())
 							continue;
-						if(m_query.matches(*e, true)) {
+						if(query.matches(*e, true)) {
 							e->mark();
-							if(m_query.update(*e, false))
+							if(query.update(*e, false))
 								++count;
 						}
 					}
@@ -433,31 +515,130 @@ void Grep::run(TelEngine::Stream& in, TelEngine::Stream& out)
 
 void Grep::output(const Entry& e, TelEngine::Stream& out)
 {
-	if(e.marked())
-		out.writeData("MARK>>> ");
+	if(m_xhtml) {
+		TelEngine::String s("<pre class=\"");
+		s << Entry::typeString(e.type());
+		if(e.marked())
+			s << " marked";
+		s << "\">";
+		out.writeData(s);
+		HtmlFilter(out, true).writeData(e);
+		out.writeData("</pre>\n");
+	}
+	else { // no xhtml
+		if(e.marked())
+			out.writeData("MARK>>> ");
 #if 0
-	out.writeData(TelEngine::String((int)e.type()));
-	out.writeData(") ");
+		out.writeData(TelEngine::String((int)e.type()));
+		out.writeData(") ");
 #endif
-	out.writeData(e);
+		out.writeData(e);
+	}
 }
 
-int main(int argc, const char* argv[])
+static void help()
 {
-	Query query;
-	query.params().setParam("billid", "1413261902-39");
-//	query.params().setParam("nonce", "993d17cc6f3b5f8a35c88b3936d3e0d7.1413253502");
-//	query.params().setParam("nodename", "unicorn");
-	Grep grep(query);
-	TelEngine::File input;
-	if(argc == 2) {
-		input.openPath(argv[1]);
-	} else {
-		input.attach(0);
+	puts("Usage:\n\tyategrep [opts] field=value inputfilename|-");
+	puts("Opts:\n\t-h\tthis help\n\t-o fn\tset output to file named fn");
+	puts("\t-D\tdump to stderr resulting query object");
+	puts("\t-x\t(X)HTML fragment output\n\t-X\tfull HTML document output");
+}
+
+const static char* html_header =
+	"<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
+	"<!DOCTYPE html>\n"
+	"<html><head>\n"
+	"<style type=\"text/css\">\n"
+	"pre { margin:0; }\n"
+	"pre.message { color:#844; }\n"
+	"pre.network { color:#44A; }\n"
+	"pre.startup { text-decoration: underline; }\n"
+	"pre.marked  { font-weight:bold; padding:3px; }\n"
+	"</style>\n"
+	"</head><body>\n";
+const static char* html_footer =
+	"</body></html>\n";
+
+
+int main(int argc, char* argv[])
+{
+	const char* outfile = NULL;
+	bool dumpquery = false;
+	bool fullhtml = false;
+	Grep grep;
+
+	/* parse command-line options */
+	++argv; // skip our filename
+	while(--argc) {
+		if(**argv != '-')
+			break;
+		switch((*argv)[1]) {
+			case 'h':
+				help();
+				return 0;
+			case 'o':
+				outfile = *++argv;
+				--argc;
+				break;
+			case 'D':
+				dumpquery = true;
+				break;
+			case 'X':
+				fullhtml = true;
+			case 'x':
+				grep.xhtml(true);
+				break;
+			default:
+				fprintf(stderr, "Unknown command-line option '%s'\n", *argv);
+				break;
+		}
+		++argv;
+	}
+	if(argc != 2) {
+		help();
+		return 1;
 	}
 
-	TelEngine::File output(1);
-	grep.run(input, output);
-	query.dump(output);
+	/* parse query */
+	char* p = *argv;
+	p = strchr(p, '=');
+	if(! p) {
+		fputs("Query argument must be key=value", stderr);
+		return 1;
+	}
+	*p++ = '\0';
+	Query query;
+	query.params().setParam(*argv, p);
+	++argv; --argc;
+
+	/* parse file name(s) */
+	TelEngine::File input;
+	TelEngine::File output;
+
+	if(outfile) {
+		output.openPath(outfile, true, false, true, false, true);
+	} else {
+		output.attach(1);
+	}
+
+	if(0 == strcmp("-", *argv)) {
+		input.attach(0);
+	} else {
+		input.openPath(*argv);
+	}
+
+	if(fullhtml)
+		static_cast<TelEngine::Stream&>(output).writeData(html_header);
+
+	grep.run(query, input, output);
+
+	if(fullhtml)
+		static_cast<TelEngine::Stream&>(output).writeData(html_footer);
+
+	if(dumpquery) {
+		TelEngine::File err(2);
+		query.dump(err);
+	}
 	return 0;
 }
+
