@@ -560,23 +560,27 @@ void Writer::eat(Entry* entry)
 			outputSeparator();
 		m_showflag = true;
 		m_tailcount = 0;
-	}
+	} else if(! m_context)
+		m_showflag = false;
 
-	if(m_buf)
+	if(m_buf) {
 		entry = m_buf->pushpop(entry);
-	if(! entry)
-		return;
+		if(! entry)
+			return;
+	}
 
 	if(m_showflag)
 		output(*entry);
 	else
 		++m_skipcount;
 
-	if(entry->marked()) {
-		m_tailcount = 0;
-	} else {
-		if(++m_tailcount == m_context)
-			m_showflag = false;
+	if(m_context) {
+		if(entry->marked()) {
+			m_tailcount = 0;
+		} else {
+			if(++m_tailcount == m_context)
+				m_showflag = false;
+		}
 	}
 	delete entry;
 }
