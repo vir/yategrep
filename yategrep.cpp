@@ -13,6 +13,7 @@ public:
 		: NamedList(text)
 		, m_type(type)
 		, m_mark(false)
+		, m_next(NULL)
 	{
 	}
 	Type type() const
@@ -36,9 +37,14 @@ public:
 				return "xxx";
 		}
 	}
+	Entry* next() const
+		{ return m_next; }
+	void next(Entry* e)
+		{ m_next = e; }
 private:
 	Type m_type;
 	bool m_mark;
+	Entry* m_next;
 };
 
 class Query
@@ -54,6 +60,13 @@ public:
 		{ return m_params; }
 	bool matches(const Entry& e, bool partial = false) const;
 	bool update(const Entry& e, bool reset); /**< Updates query with new channels and addresses from log entry. @return true if query was really modified */
+	void flush()
+	{
+		m_channels.clear();
+		m_newChannels = 0;
+		m_addrs.clear();
+		m_newAddrs = 0;
+	}
 	void dump(TelEngine::Stream& out)
 	{
 		out.writeData("Query params:\n ");
@@ -107,79 +120,77 @@ private:
 	bool m_verbatimCopy;
 };
 
-template<class T>
-class RingBuf
+class LogBuf
 {
 public:
-	RingBuf(size_t size)
-		: m_size(size), m_put_index(0), m_get_index(0), m_empty(true)
-		{ m_buf = new T*[size]; }
-	~RingBuf()
-		{ delete[] m_buf; }
-	void push(T* entry)
+	LogBuf(size_t size)
+		: m_size(size)
+		, m_head(NULL)
+		, m_tail(NULL)
+		, m_count(0)
+		{ }
+	~LogBuf()
 	{
-		if(m_put_index == m_get_index && ! m_empty)
-			return; // XXX overflow XXX
-		m_buf[m_put_index++] = entry;
-		if(m_put_index >= m_size)
-			m_put_index = 0;
-		m_empty = false;
+		if(m_head || m_tail || m_count)
+			fprintf(stderr, "EntryBuf destructed with %u entries\n", m_count);
 	}
-	T* pop()
+	inline void push(Entry* e)
 	{
-		if(m_empty)
+		if(m_tail) {
+			m_tail->next(e);
+			++m_count;
+		} else {
+			m_head = m_tail = e;
+			m_count = 1;
+		}
+		m_tail = e;
+	}
+	inline Entry* pop()
+	{
+		if(! m_head)
 			return NULL;
-		T* entry = m_buf[m_get_index++];
-		if(m_get_index >= m_size)
-			m_get_index = 0;
-		if(m_get_index == m_put_index)
-			m_empty = true;
-		return entry;
+		Entry* e = m_head;
+		if(!(m_head = e->next()))
+			m_tail = NULL;
+		--m_count;
+		e->next(NULL);
+		return e;
 	}
-	T* pushpop(T* newentry)
+	inline Entry* pushpop(Entry* ne)
 	{
-		T* r = NULL;
-		if(m_put_index == m_get_index && ! m_empty)
-			r = m_buf[m_get_index++];
-		if(m_get_index >= m_size)
-			m_get_index = 0;
-		m_buf[m_put_index++] = newentry;
-		if(m_put_index >= m_size)
-			m_put_index = 0;
-		m_empty = false;
+		if(! ne)
+			return pop();
+		push(ne);
+		return (m_count <= m_size) ? NULL : pop();
+	}
+	inline Entry* head()
+		{ return m_head; }
+	inline size_t size() const
+		{ return m_size; }
+	inline void size(size_t s)
+		{ m_size = s; }
+	inline size_t count() const
+		{ return m_count; }
+	inline size_t avail() const
+		{ return m_size - count(); }
+	Entry* at(size_t index)
+	{
+		Entry* r = m_head;
+		while(r && index) {
+			r = r->next();
+			--index;
+		}
 		return r;
 	}
-	size_t size() const
-		{ return m_size; }
-	size_t count() const
-	{
-		if(m_empty)
-			return 0;
-		else if(m_put_index > m_get_index)
-			return m_put_index - m_get_index;
-		else
-			return m_put_index + m_size - m_get_index;
-	}
-	size_t avail() const
-		{ return m_size - count(); }
-	T* at(size_t index)
-	{
-		if(index >= count())
-			return NULL;
-		index += m_get_index;
-		if(index >= m_size)
-			index -= m_size;
-		return m_buf[index];
-	}
-	bool empty() const
-		{ return m_empty; }
+	inline bool empty() const
+		{ return ! m_head; }
 private:
-	T** m_buf;
 	size_t m_size;
-	size_t m_put_index;
-	size_t m_get_index;
-	bool m_empty;
+	Entry* m_head;
+	Entry* m_tail;
+	size_t m_count;
 };
+
 
 class HtmlFilter:public TelEngine::Stream
 {
@@ -273,7 +284,7 @@ public:
 	{
 		delete m_buf;
 		m_context = lines;
-		m_buf = lines ? new RingBuf<Entry>(lines) : NULL;
+		m_buf = lines ? new LogBuf(lines) : NULL;
 	}
 protected:
 	void output(const Entry& e);
@@ -285,7 +296,7 @@ private:
 	bool m_showflag;
 	unsigned int m_tailcount;
 	unsigned int m_skipcount;
-	RingBuf<Entry>* m_buf;
+	LogBuf* m_buf;
 };
 
 class Grep
@@ -295,8 +306,9 @@ public:
 		: m_buf(backlog)
 		{ }
 	void run(Query& query, Parser parser, Writer& writer);
+	void flushBuffer(Writer& writer);
 private:
-	RingBuf<Entry> m_buf;
+	LogBuf m_buf;
 };
 
 static bool isChannelParam(const TelEngine::String& name)
@@ -507,40 +519,28 @@ Entry* Parser::get()
 
 void Grep::run(Query& query, Parser parser, Writer& writer)
 {
-#if 0 // very simple "/bin/cat"
-	char buf[8192];
-	int rd;
-	while((rd = in.readData(buf, sizeof(buf)))) {
-		out.writeData(buf, rd);
-	}
-#elif 0 // advanced "/bin/cat"
-	Parser parser(in);
 	Entry* e = NULL;
 	while(( e = parser.get() )) {
-		out.writeData(*e);
-		delete e;
-	}
-#else
-	Entry* e = NULL;
-	while(( e = parser.get() )) {
+		if(e->type() == Entry::STARTUP) {
+			flushBuffer(writer);
+			query.flush();
+		}
 		if(query.matches(*e)) {
 			e->mark();
 #if 1 /* DEEP SEARCH */
 			if(query.update(*e, true)) {
-				int count;
+				bool modified;
 				do {
-					count = 0;
-					for(size_t index = 0; index < m_buf.count() - 1; ++index) {
-						Entry* e = m_buf.at(index);
-						if(!e || e->marked())
+					modified = false;
+					for(Entry* t = m_buf.head(); t && !modified; t = t->next()) {
+						if(t->marked())
 							continue;
-						if(query.matches(*e, true)) {
-							e->mark();
-							if(query.update(*e, false))
-								++count;
-						}
+						if(! query.matches(*t, true))
+							continue;
+						t->mark();
+						modified = query.update(*t, false);
 					}
-				} while(count);
+				} while(modified);
 			}
 #endif
 		}
@@ -548,9 +548,14 @@ void Grep::run(Query& query, Parser parser, Writer& writer)
 		if(e)
 			writer.eat(e);
 	}
-	while(! m_buf.empty())
-		writer.eat(m_buf.pop());
-#endif
+	flushBuffer(writer);
+}
+
+void Grep::flushBuffer(Writer& writer)
+{
+	Entry* e;
+	while((e = m_buf.pop()))
+		writer.eat(e);
 }
 
 void Writer::eat(Entry* entry)
@@ -640,7 +645,7 @@ const static char* html_header =
 	"pre.message { color:#844; }\n"
 	"pre.network { color:#44A; }\n"
 	"pre.startup { text-decoration: underline; }\n"
-	"pre.marked  { font-weight:bold; padding:3px; }\n"
+	"pre.marked  { font-weight:bold; padding:3px; background-color:#EFE; }\n"
 	"</style>\n"
 	"</head><body>\n";
 const static char* html_footer =
@@ -709,7 +714,7 @@ int main(int argc, char* argv[])
 	/* parse file name(s) */
 
 	if(outfile) {
-		output.openPath(outfile, true, false, true, false, true);
+		output.openPath(outfile, true, false, true, false, true, true, false);
 	} else {
 		output.attach(1);
 	}
