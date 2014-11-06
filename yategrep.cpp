@@ -83,9 +83,15 @@ public:
 		out.writeData("\nAddresses:\n");
 		for(TelEngine::ObjList* p = m_addrs.skipNull(); p; p = p->skipNext()) {
 			out.writeData(" ");
-			out.writeData(p->toString());
+			out.writeData(p->get()->toString());
 		}
 		out.writeData("\n");
+	}
+	TelEngine::String stats() const
+	{
+		TelEngine::String s("params: ");
+		s << m_params.count() << " chans: " << m_channels.count() << " addrs: " << m_addrs.count();
+		return s;
 	}
 private:
 	TelEngine::NamedList m_params;
@@ -107,6 +113,8 @@ public:
 	{
 	}
 	Entry* get();
+	int64_t pos() const
+		{ return m_stream.seek(TelEngine::Stream::SeekCurrent); }
 protected:
 	TelEngine::String getLine(int eol = '\n');
 	Entry* parseLine(TelEngine::String s);
@@ -299,16 +307,69 @@ private:
 	LogBuf* m_buf;
 };
 
+class Progress;
+
 class Grep
 {
 public:
-	Grep(size_t backlog = 1000)
+	Grep(size_t backlog)
 		: m_buf(backlog)
+		, m_markedCount(0)
 		{ }
-	void run(Query& query, Parser parser, Writer& writer);
+	void run(Query& query, Parser parser, Writer& writer, Progress* progress);
 	void flushBuffer(Writer& writer);
+	TelEngine::String stats() const
+	{
+		return TelEngine::String("marked: ") << m_markedCount;
+	}
 private:
 	LogBuf m_buf;
+	u_int32_t m_markedCount;
+};
+
+class Progress
+{
+public:
+	Progress(const Grep& grep, const Parser& parser, const Query& query, const Writer& writer)
+		: m_grep(grep)
+		, m_parser(parser)
+		, m_query(query)
+		, m_writer(writer)
+		, m_last_update(0)
+		{ }
+	void file(const TelEngine::String& name, int64_t length)
+		{ m_name = name; m_length = length; }
+	void update()
+	{
+		u_int32_t now = TelEngine::Time::secNow();
+		if(now == m_last_update)
+			return;
+		TelEngine::String s("\r");
+		if(m_length) {
+			char percent[10];
+			sprintf(percent, " %3.1f%%  ", 100.0 * (double)m_parser.pos() / (double)m_length);
+			s << m_name << percent;
+		}
+		s << " Grep: " << m_grep.stats();
+		s << " Query: " << m_query.stats();
+		m_strlen = fprintf(stderr, "%s", s.c_str());
+
+		m_last_update = now;
+	}
+	void done()
+	{
+		fprintf(stderr, "\r%s DONE    \n", m_name.c_str());
+	}
+private:
+	const Grep& m_grep;
+	const Parser& m_parser;
+	const Query& m_query;
+	const Writer& m_writer;
+
+	TelEngine::String m_name;
+	int64_t m_length;
+	u_int32_t m_last_update;
+	int m_strlen;
 };
 
 static bool isChannelParam(const TelEngine::String& name)
@@ -332,6 +393,16 @@ static bool isChannelParam(const TelEngine::String& name)
 		return true;
 	return false;
 }
+
+static bool isAddressParam(const TelEngine::NamedString& s)
+{
+	using namespace TelEngine;
+	const static TelEngine::Regexp re("[\\.\\/:]"); // to seize addresses like "ring", "" etc
+	if(s.name() == YSTRING("address") && re.matches(s))
+		return true;
+	return false;
+}
+
 
 static bool fullMatch(const TelEngine::NamedList& key, const TelEngine::NamedList& entry)
 {
@@ -389,13 +460,32 @@ bool Query::matches(const Entry& e, bool partial /* = false */) const
 				return true;
 		}
 	}
-	// TODO: check addresses
+	if(e.type() != Entry::NETWORK) // select by addresses only network messages or we will gel tons of selected junk
+		return false;
+	for(TelEngine::ObjList* addrs = m_addrs + (partial ? m_newAddrs : 0); addrs; addrs = addrs->skipNext()) { // check addresses
+		TelEngine::GenObject* o = addrs->get();
+		if(! o)
+			continue;
+		TelEngine::String addr = o->toString();
+		unsigned int n = e.length();
+		for(unsigned int i = 0; i < n; ++i) {
+			TelEngine::NamedString* s = e.getParam(i);
+			if(! s)
+				continue;
+			if(! isAddressParam(*s))
+				continue;
+			if(*s == addr)
+				return true;
+		}
+	}
 	return false;
 }
 
 /* Updates query with new channels and addresses from log entry. @return true if query was really modified */
 bool Query::update(const Entry& e, bool reset)
 {
+	if(e.type() != Entry::MESSAGE) // Update only from messages
+		return false;
 	if(reset) {
 		m_newChannels = m_channels.count();
 		m_newAddrs = m_addrs.count();
@@ -406,14 +496,18 @@ bool Query::update(const Entry& e, bool reset)
 		TelEngine::NamedString* s = e.getParam(i);
 		if(! s)
 			continue;
-		if(! isChannelParam(s->name()))
-			continue;
-		if(m_channels.find(*s))
-			continue;
-		m_channels.append(new TelEngine::String(*s), false);
-		modified = true;
+		if(isChannelParam(s->name())) {
+			if(m_channels.find(*s))
+				continue;
+			m_channels.append(new TelEngine::String(*s), false);
+			modified = true;
+		} else if(isAddressParam(*s)) {
+			if(m_addrs.find(*s))
+				continue;
+			m_addrs.append(new TelEngine::String(*s), false);
+			modified = true;
+		}
 	}
-	/* XXX TODO: check for new addresses */
 	return modified;
 }
 
@@ -444,9 +538,10 @@ Entry* Parser::parseLine(TelEngine::String s)
 	const static TelEngine::Regexp re2("^  param\\['\\(.*\\)'\\] = '\\(.*\\)'");
 	const static TelEngine::Regexp re3("^  param\\['\\(.*\\)'\\] = '\\(.*\\)");
 	const static TelEngine::Regexp re4("^-----");
-	const static TelEngine::Regexp re5("^\\([0-9\\.]\\+ \\)\\?<[a-zA-Z0-9]\\+:[a-zA-Z0-9]\\+> '.*' \\(sending\\|received\\) .* \\(to\\|from\\) \\([0-9\\.]\\+\\):[0-9]\\+");
-	const static TelEngine::Regexp re6("^\\([0-9\\.]\\+ \\)\\?<[a-zA-Z0-9]\\+:[a-zA-Z0-9]\\+> '[a-z]\\+:[0-9\\.]\\+:[0-9]\\+-\\([0-9\\.]\\+\\):[0-9]\\+' \\(received [0-9]\\+ bytes\\|sending code [0-9]\\+\\)");
+	const static TelEngine::Regexp re5("^\\([0-9\\.]\\+ \\)\\?<[a-zA-Z0-9]\\+:[a-zA-Z0-9]\\+> '.*' \\(sending\\|received\\) .* \\(to\\|from\\) \\([0-9\\.]\\+:[0-9]\\+\\)");
+	const static TelEngine::Regexp re6("^\\([0-9\\.]\\+ \\)\\?<[a-zA-Z0-9]\\+:[a-zA-Z0-9]\\+> '[a-z]\\+:[0-9\\.]\\+:[0-9]\\+-\\([0-9\\.]\\+:[0-9]\\+\\)' \\(received [0-9]\\+ bytes\\|sending code [0-9]\\+\\)");
 	const static TelEngine::Regexp re7("^Yate ([0-9]\\+) is starting ");
+	const static TelEngine::Regexp re8("^\\([0-9\\.]\\+ \\)\\?<\\([^ /:>]\\+\\)/Q931:[a-zA-Z]*> .*");
 	if(m_verbatimCopy && m_last) {
 		m_last->append(s);
 		if(s.matches(re4))
@@ -482,9 +577,16 @@ Entry* Parser::parseLine(TelEngine::String s)
 		e->setParam("address", s.matchString(4));
 		return e;
 	}
-	if(s.matches(re5) || s.matches(re6)) {
-//		fprintf(stderr, "Got network: %s\n", s.c_str());
-		return new Entry(Entry::NETWORK, s);
+	if(s.matches(re5)) {
+		Entry* e = new Entry(Entry::NETWORK, s);
+//		e->setParam("ts", s.matchString(1);
+		e->setParam("address", s.matchString(4));
+		return e;
+	}
+	if(s.matches(re6) || s.matches(re8)) {
+		Entry* e = new Entry(Entry::NETWORK, s);
+		e->setParam("address", s.matchString(2));
+		return e;
 	}
 	if(s.matches(re4) && m_last) {
 		m_last->append(s);
@@ -517,9 +619,10 @@ Entry* Parser::get()
 	}
 }
 
-void Grep::run(Query& query, Parser parser, Writer& writer)
+void Grep::run(Query& query, Parser parser, Writer& writer, Progress* progress)
 {
 	Entry* e = NULL;
+	Entry* last_marked_message = NULL;
 	while(( e = parser.get() )) {
 		if(e->type() == Entry::STARTUP) {
 			flushBuffer(writer);
@@ -527,6 +630,9 @@ void Grep::run(Query& query, Parser parser, Writer& writer)
 		}
 		if(query.matches(*e)) {
 			e->mark();
+			++m_markedCount;
+			if(e->type() == Entry::MESSAGE)
+				last_marked_message = e;
 #if 1 /* DEEP SEARCH */
 			if(query.update(*e, true)) {
 				bool modified;
@@ -538,6 +644,9 @@ void Grep::run(Query& query, Parser parser, Writer& writer)
 						if(! query.matches(*t, true))
 							continue;
 						t->mark();
+						++m_markedCount;
+						if(e->type() == Entry::MESSAGE)
+							last_marked_message = e;
 						modified = query.update(*t, false);
 					}
 				} while(modified);
@@ -545,10 +654,20 @@ void Grep::run(Query& query, Parser parser, Writer& writer)
 #endif
 		}
 		e = m_buf.pushpop(e);
-		if(e)
+		if(e) {
 			writer.eat(e);
+			if(e == last_marked_message) { // no more marked MESSAGEs in buffer
+				last_marked_message = NULL;
+				/* we flush query here to stop marking useless NETWORK messages */
+				query.flush();
+			}
+		}
+		if(progress)
+			progress->update();
 	}
 	flushBuffer(writer);
+	if(progress)
+		progress->done();
 }
 
 void Grep::flushBuffer(Writer& writer)
@@ -719,17 +838,21 @@ int main(int argc, char* argv[])
 		output.attach(1);
 	}
 
+	Progress* progress = NULL;
+	Grep grep(300);
+
 	if(0 == strcmp("-", *argv)) {
 		input.attach(0);
 	} else {
 		input.openPath(*argv);
+		progress = new Progress(grep, parser, query, writer);
+		progress->file(*argv, input.length());
 	}
 
 	if(fullhtml)
 		static_cast<TelEngine::Stream&>(output).writeData(html_header);
 
-	Grep grep;
-	grep.run(query, parser, writer);
+	grep.run(query, parser, writer, progress);
 
 	if(fullhtml)
 		static_cast<TelEngine::Stream&>(output).writeData(html_footer);
