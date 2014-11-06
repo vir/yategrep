@@ -52,6 +52,8 @@ class Query
 public:
 	Query()
 		: m_params("QueryParams")
+		, m_noNetwork(false)
+		, m_dumpOnFlush(false)
 	{
 	}
 	TelEngine::NamedList& params()
@@ -62,6 +64,10 @@ public:
 	bool update(const Entry& e, bool reset); /**< Updates query with new channels and addresses from log entry. @return true if query was really modified */
 	void flush()
 	{
+		if(m_dumpOnFlush) {
+			TelEngine::File err(2);
+			dump(err);
+		}
 		m_channels.clear();
 		m_newChannels = 0;
 		m_addrs.clear();
@@ -93,12 +99,16 @@ public:
 		s << m_params.count() << " chans: " << m_channels.count() << " addrs: " << m_addrs.count();
 		return s;
 	}
+	void noNetwork(bool b) { m_noNetwork = b; }
+	void dumpOnFlush(bool b) { m_dumpOnFlush = b; }
 private:
 	TelEngine::NamedList m_params;
 	TelEngine::ObjList m_channels;
 	unsigned int m_newChannels;
 	TelEngine::ObjList m_addrs;
 	unsigned int m_newAddrs;
+	bool m_noNetwork;
+	bool m_dumpOnFlush;
 };
 
 class Parser
@@ -460,7 +470,7 @@ bool Query::matches(const Entry& e, bool partial /* = false */) const
 				return true;
 		}
 	}
-	if(e.type() != Entry::NETWORK) // select by addresses only network messages or we will gel tons of selected junk
+	if(e.type() != Entry::NETWORK || m_noNetwork) // select by addresses only network messages or we will gel tons of selected junk
 		return false;
 	for(TelEngine::ObjList* addrs = m_addrs + (partial ? m_newAddrs : 0); addrs; addrs = addrs->skipNext()) { // check addresses
 		TelEngine::GenObject* o = addrs->get();
@@ -753,6 +763,8 @@ static void help()
 	puts("\t-D\tdump to stderr resulting query object");
 	puts("\t-x\t(X)HTML fragment output\n\t-X\tfull HTML document output");
 	puts("\t-C nn\tshow nn messages of context before and after each match");
+	puts("\t-B nnn\tset buffer size to nnn messages (default: 300)");
+	puts("\t-N\tdo not select network messages");
 }
 
 const static char* html_header =
@@ -774,13 +786,14 @@ const static char* html_footer =
 int main(int argc, char* argv[])
 {
 	const char* outfile = NULL;
-	bool dumpquery = false;
 	bool fullhtml = false;
+	size_t grepbufsize = 300;
 
 	TelEngine::File input;
 	TelEngine::File output;
 	Parser parser(input);
 	Writer writer(output);
+	Query query;
 
 	/* parse command-line options */
 	++argv; // skip our filename
@@ -796,7 +809,7 @@ int main(int argc, char* argv[])
 				--argc;
 				break;
 			case 'D':
-				dumpquery = true;
+				query.dumpOnFlush(true);
 				break;
 			case 'X':
 				fullhtml = true;
@@ -806,6 +819,13 @@ int main(int argc, char* argv[])
 			case 'C':
 				writer.context(atoi(*++argv));
 				--argc;
+				break;
+			case 'B':
+				grepbufsize = strtoul(*++argv, NULL, 10);
+				--argc;
+				break;
+			case 'N':
+				query.noNetwork(true);
 				break;
 			default:
 				fprintf(stderr, "Unknown command-line option '%s'\n", *argv);
@@ -826,7 +846,6 @@ int main(int argc, char* argv[])
 		return 1;
 	}
 	*p++ = '\0';
-	Query query;
 	query.params().setParam(*argv, p);
 	++argv; --argc;
 
@@ -839,7 +858,7 @@ int main(int argc, char* argv[])
 	}
 
 	Progress* progress = NULL;
-	Grep grep(300);
+	Grep grep(grepbufsize);
 
 	if(0 == strcmp("-", *argv)) {
 		input.attach(0);
@@ -857,10 +876,7 @@ int main(int argc, char* argv[])
 	if(fullhtml)
 		static_cast<TelEngine::Stream&>(output).writeData(html_footer);
 
-	if(dumpquery) {
-		TelEngine::File err(2);
-		query.dump(err);
-	}
+	query.flush(); // dump if enabled
 	return 0;
 }
 
