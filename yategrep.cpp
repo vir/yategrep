@@ -732,13 +732,11 @@ void Writer::output(const Entry& e)
 		m_strm.writeData("</pre>\n");
 	}
 	else { // no xhtml
-		if(e.marked())
-			m_strm.writeData("MARK>>> ");
-#if 0
-		m_strm.writeData(TelEngine::String((int)e.type()));
-		m_strm.writeData(") ");
-#endif
+		if(e.marked() && m_context)
+			m_strm.writeData("\x1B[1m");
 		m_strm.writeData(e);
+		if(e.marked() && m_context)
+			m_strm.writeData("\x1B[0m");
 	}
 	m_skipcount = 0;
 }
